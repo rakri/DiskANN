@@ -6,3 +6,4 @@
 //! Extensions for search.
 
 pub mod labeled;
+pub mod scored;
