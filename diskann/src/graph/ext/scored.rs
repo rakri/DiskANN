@@ -14,6 +14,20 @@
 //! and accept-only expansion, including skipping distances for rejected second-hop
 //! neighbors. Scoring alone does not reject candidates.
 //!
+//! # Reading This File
+//!
+//! A vector is a list of numbers describing an item; a query is another such list.
+//! Smaller distances mean better matches. DiskANN connects items in a graph and
+//! explores promising connections instead of comparing the query with every item.
+//! This extension changes how promising an item looks, for example by favoring a
+//! recent item over an equally similar older item. It does not rebuild the graph.
+//!
+//! In the code, a "strategy" supplies the search behavior, an "accessor" retrieves
+//! items and computes distances, and a "post-processor" prepares the final answers.
+//! A callback is a scoring function supplied by the caller. Rust's `struct` groups
+//! related values, while `impl` supplies behavior for those values. Type letters
+//! let the same adapter work with different storage systems and scoring functions.
+//!
 //! # Example
 //!
 //! This example assumes internal and output IDs use the same timestamp lookup. For
@@ -30,17 +44,22 @@
 //! #     S: for<'a> glue::DefaultSearchStrategy<'a, DP, &'a [f32], u32,
 //! #         SearchAccessor: glue::SearchAccessor>,
 //! # {
+//! // Keep up to 64 candidates during graph exploration; this is the search budget.
 //! let knn = Knn::new_default(64)?;
 //! let mut output = Vec::new();
+//! // Only opt into the new scoring behavior when this query includes a timestamp.
 //! if let Some(timestamp) = query_timestamp {
+//!     // Add a penalty for time difference. With no stored timestamp, use distance alone.
 //!     let score = |id: u32, distance: f32| {
 //!         let penalty = timestamps.get(id as usize)
 //!             .map_or(0.0, |stored| (stored - timestamp).abs());
 //!         distance + penalty
 //!     };
+//!     // Apply the policy while exploring the graph and when ranking final answers.
 //!     let strategy = Scored::new(base, score, |id: &u32, distance| score(*id, distance));
 //!     index.search(knn, &strategy, context, query, &mut output).await?;
 //! } else {
+//!     // Without query metadata, call the original search with no scoring overhead.
 //!     index.search(knn, &base, context, query, &mut output).await?;
 //! }
 //! # Ok(output)
@@ -79,6 +98,9 @@ use crate::{
 ///
 /// A vector-similarity graph remains approximate under a different scoring policy;
 /// increasing the influence of metadata may require more exploration for good recall.
+///
+/// Think of this as a per-query set of instructions: keep the original search machinery,
+/// but use the supplied functions to decide which items to explore and return first.
 #[derive(Debug, Clone, Copy)]
 pub struct Scored<S, N, R> {
     strategy: S,
@@ -88,6 +110,9 @@ pub struct Scored<S, N, R> {
 
 impl<S, N, R> Scored<S, N, R> {
     /// Construct a query-scoped strategy with navigation and final-result scoring.
+    ///
+    /// This packages instructions only; it does not copy vectors, copy metadata, or
+    /// build a new index. The caller's functions can refer to existing metadata.
     pub fn new(strategy: S, navigation: N, results: R) -> Self {
         Self {
             strategy,
@@ -97,6 +122,8 @@ impl<S, N, R> Scored<S, N, R> {
     }
 }
 
+// This is the existing graph-search entry point. When search asks for its data-access
+// helper, wrap the normal helper rather than replacing the search algorithm.
 impl<'a, DP, S, T, N, R> glue::SearchStrategy<'a, DP, T> for Scored<S, N, R>
 where
     DP: DataProvider,
@@ -113,6 +140,8 @@ where
         context: &'a DP::Context,
         query: T,
     ) -> Result<Self::SearchAccessor, Self::SearchAccessorError> {
+        // Each query gets its own record of unmodified distances. These are needed
+        // later because the storage system must not mistake adjusted scores for distances.
         Ok(Accessor {
             inner: self.strategy.search_accessor(provider, context, query)?,
             navigation: &self.navigation,
@@ -121,6 +150,8 @@ where
     }
 }
 
+// Choose how answers are finalized. The wrapper lets the storage system do its normal
+// result preparation, then applies metadata scoring before the answer list is shortened.
 impl<'a, DP, S, T, O, N, R> glue::DefaultPostProcessor<'a, DP, T, O> for Scored<S, N, R>
 where
     DP: DataProvider,
@@ -140,7 +171,10 @@ where
     }
 }
 
-/// An accessor that adjusts emitted distances while retaining the original distances.
+/// The per-query helper that adjusts distances before graph search receives them.
+///
+/// The inner helper still owns data access. The extra table remembers original vector
+/// distances, so later result preparation can start from those rather than score twice.
 pub struct Accessor<'a, A, N>
 where
     A: HasId,
@@ -155,15 +189,21 @@ where
     A: HasId,
 {
     /// Access the backend for custom post-processing or instrumentation.
+    ///
+    /// This allows a caller to use storage-specific features without removing the wrapper.
     pub fn inner(&mut self) -> &mut A {
         &mut self.inner
     }
 }
 
+// Keep the same item identifiers as the underlying storage. Scoring changes priority,
+// not identity, so graph connections and existing filters keep referring to the same items.
 impl<A: HasId, N> HasId for Accessor<'_, A, N> {
     type Id = A::Id;
 }
 
+// Preserve the original number, then calculate the number used for navigation.
+// The graph's existing candidate queue will receive the adjusted value.
 fn score<I, N>(original: &mut HashMap<I, f32>, navigation: &N, id: I, distance: f32) -> f32
 where
     I: Copy + Eq + Hash,
@@ -173,15 +213,20 @@ where
     navigation(id, distance)
 }
 
+// Ordinary graph search uses this interface to obtain starting points and nearby items.
+// Only distances are changed; the backend still chooses how to retrieve the data.
 impl<A, N> glue::SearchAccessor for Accessor<'_, A, N>
 where
     A: glue::SearchAccessor<Id: Copy + Eq + Hash + Send + Sync>,
     N: Fn(A::Id, f32) -> f32 + Sync,
 {
+    // Preserve the graph's entry points: the places where exploration begins.
     async fn starting_points(&self) -> ANNResult<Vec<Self::Id>> {
         self.inner.starting_points().await
     }
 
+    // Starting points need adjusted scores too, or exploration would begin using a
+    // different ranking rule from the one used for the rest of the graph.
     async fn start_point_distances<F>(&mut self, mut f: F) -> ANNResult<()>
     where
         F: FnMut(Self::Id, f32) + Send,
@@ -193,6 +238,8 @@ where
             .await
     }
 
+    // A "beam" is a group of promising items being explored together. Ask the backend
+    // for their neighbors, then adjust each distance before search can queue that item.
     async fn expand_beam<Itr, P, F>(
         &mut self,
         ids: Itr,
@@ -213,26 +260,34 @@ where
             .await
     }
 
+    // Preserve the backend's request to stop, such as cancellation or another limit.
     fn terminate_early(&mut self) -> bool {
         self.inner.terminate_early()
     }
 
+    // Special entry points can help navigation without being real answers.
+    // Keep the backend's existing rule for excluding them from the returned results.
     async fn is_not_start_point(
         &self,
     ) -> ANNResult<impl Fn(Self::Id) -> bool + Send + Sync + 'static> {
         self.inner.is_not_start_point().await
     }
 
+    // Let search size its working buffers using the backend's entry-point count.
     async fn num_starting_points(&self) -> ANNResult<usize> {
         self.inner.num_starting_points().await
     }
 }
 
+// Filter-aware search also needs to know whether each item is allowed as an answer.
+// Keep that decision separate from its score: an ineligible item can still provide
+// useful graph connections on the way to eligible items.
 impl<A, N> glue::FilteredAccessor for Accessor<'_, A, N>
 where
     A: glue::FilteredAccessor<Id: Copy + Eq + Hash + Send + Sync>,
     N: Fn(A::Id, f32) -> f32 + Sync,
 {
+    // Keep each entry point's accept/reject decision, but adjust its navigation score.
     async fn start_point_distances<F>(&mut self, mut f: F) -> ANNResult<()>
     where
         F: FnMut(glue::Decision<Self::Id>, f32) + Send,
@@ -249,6 +304,8 @@ where
             .await
     }
 
+    // This path reports both accepted and rejected neighbors. Preserve both kinds,
+    // because the search algorithm may use rejected items as bridges through the graph.
     async fn expand_beam_filtered<Itr, P, F>(
         &mut self,
         ids: Itr,
@@ -272,6 +329,9 @@ where
             .await
     }
 
+    // Multihop search uses this path when it wants only matching neighbors of a bridge.
+    // Let the backend filter first, avoiding vector-distance work for rejected items
+    // and preserving the rule that only accepted items may be marked visited here.
     async fn expand_beam_accept_only<Itr, P, F>(
         &mut self,
         ids: Itr,
@@ -295,10 +355,12 @@ where
             .await
     }
 
+    // Metadata scoring must not prevent the backend from stopping filtered search.
     fn terminate_early(&mut self) -> bool {
         self.inner.terminate_early()
     }
 
+    // Filtered search sizes its working buffers using the same backend entry points.
     async fn num_starting_points(&self) -> ANNResult<usize> {
         self.inner.num_starting_points().await
     }
@@ -307,6 +369,9 @@ where
 /// Restore base distances for the backend, then score and sort its output before truncation.
 ///
 /// Compose this step with a custom backend post-processor using [`glue::Pipeline`].
+/// Storage may recompute more accurate distances or translate internal numbers into
+/// user-facing IDs. This step surrounds that work so metadata is applied once to the
+/// finished distances, before selecting the final number of answers.
 pub struct Rescore<'a, R> {
     results: &'a R,
 }
@@ -318,6 +383,9 @@ impl<'a, R> Rescore<'a, R> {
     }
 }
 
+// This final-ranking step connects the wrapped accessor back to the backend's original
+// result preparation. An unbounded temporary answer list prevents an early top-k cutoff
+// from discarding an item that metadata would have promoted into the final answers.
 impl<A, N, R, T, O> glue::SearchPostProcessStep<Accessor<'_, A, N>, T, O> for Rescore<'_, R>
 where
     A: HasId<Id: Copy + Eq + Hash + Debug + Send> + Send,
@@ -346,6 +414,8 @@ where
         B: SearchOutputBuffer<O> + Send + ?Sized,
         Next: glue::SearchPostProcess<A, T, O> + Sync,
     {
+        // Restore each candidate's original vector distance. Navigation scores are
+        // not necessarily meaningful input for the backend's existing result handling.
         let mut candidates = candidates
             .map(|candidate| {
                 let id = *candidate.id();
@@ -359,6 +429,8 @@ where
             .collect::<ANNResult<Vec<_>>>()?;
         candidates.sort_unstable_by(neighbor::ord::fast_distance);
 
+        // Let the backend remove invalid answers, translate IDs, or recompute exact
+        // distances. Collect all answers it produces rather than stopping at k yet.
         let mut results = Vec::with_capacity(candidates.len());
         next.post_process(
             &mut accessor.inner,
@@ -372,6 +444,8 @@ where
             error.context("post-processing before metadata scoring")
         })?;
 
+        // Apply the final metadata rule to the backend's finished distances. Ranking
+        // uses these new scores, not the potentially approximate navigation scores.
         let mut results: Vec<_> = results
             .into_iter()
             .map(|neighbor| {
@@ -380,11 +454,14 @@ where
                 Neighbor::new(id, distance)
             })
             .collect();
+        // Only now sort and fill the caller's output, which may have room for just k items.
         results.sort_unstable_by(neighbor::ord::fast_distance);
         Ok(output.extend(results))
     }
 }
 
+// These small, predictable examples test correctness, not speed. A separate benchmark
+// tool measures behavior on a much larger dataset without making normal tests expensive.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +476,7 @@ mod tests {
     };
     use diskann_vector::distance::Metric;
 
+    // A simple eligibility rule makes filtering easy to inspect: only even IDs qualify.
     #[derive(Debug)]
     struct Even;
 
@@ -408,6 +486,8 @@ mod tests {
         }
     }
 
+    // Verify that the metadata adjustment reaches search for both entry points and
+    // ordinary neighbors, rather than being applied only after search has finished.
     #[tokio::test]
     async fn scores_start_points_and_neighbors() {
         let provider = test_provider::Provider::grid(Grid::Two, 4).unwrap();
@@ -448,6 +528,8 @@ mod tests {
         }
     }
 
+    // Rejected items must not incur vector-distance work or enter the visited set
+    // on the accept-only path used by multihop search.
     #[tokio::test]
     async fn accept_only_preserves_filter_before_distance() {
         let provider = test_provider::Provider::grid(Grid::Two, 4).unwrap();
@@ -485,12 +567,16 @@ mod tests {
         assert_eq!(provider.get_vector.value(), computed);
     }
 
+    // A tiny stand-in for a storage backend isolates final-ranking behavior from
+    // graph traversal, making wrong ordering or repeated score adjustments obvious.
     struct Backend;
 
     impl HasId for Backend {
         type Id = u32;
     }
 
+    // Pretend the backend produces more accurate distances and user-facing string IDs.
+    // The assertions below check that it receives raw distances, not adjusted scores.
     struct Rerank;
 
     impl glue::SearchPostProcess<Backend, (), String> for Rerank {
@@ -521,6 +607,8 @@ mod tests {
         }
     }
 
+    // Give the output room for only one answer, then make metadata favor the initially
+    // worse candidate. It must survive backend preparation and win the final ranking.
     #[tokio::test]
     async fn restores_base_distances_and_scores_before_truncation() {
         let navigation = |_: u32, distance: f32| distance + 1000.0;
@@ -555,6 +643,8 @@ mod tests {
         assert_eq!(distances, [8.0]);
     }
 
+    // A candidate without a saved original distance indicates an invalid pipeline.
+    // Report that problem instead of silently returning an answer with a wrong score.
     #[tokio::test]
     async fn missing_original_distance_is_an_error() {
         let navigation = |_: u32, distance: f32| distance;
@@ -579,6 +669,7 @@ mod tests {
         assert!(output.is_empty());
     }
 
+    // Deliberately fail result preparation to check that the wrapper does not hide errors.
     struct FailedPostProcess;
 
     impl glue::SearchPostProcess<Backend, ()> for FailedPostProcess {
@@ -599,6 +690,7 @@ mod tests {
         }
     }
 
+    // Storage failures must reach the caller, and must not leave partial final answers.
     #[tokio::test]
     async fn preserves_backend_post_process_errors() {
         let navigation = |_: u32, distance: f32| distance;
@@ -623,6 +715,7 @@ mod tests {
         assert!(output.is_empty());
     }
 
+    // A small connected grid supplies known neighbors without downloading a dataset.
     fn grid_index() -> crate::graph::DiskANNIndex<test_provider::Provider> {
         let config = crate::graph::config::Builder::new(
             4,
@@ -639,6 +732,8 @@ mod tests {
         )
     }
 
+    // Compare two queries: without metadata, results and search effort must match the
+    // original path; with timestamps, the preferred item must change as requested.
     #[tokio::test]
     async fn optional_query_metadata_keeps_the_vanilla_path() {
         let index = grid_index();
@@ -698,6 +793,8 @@ mod tests {
         }
     }
 
+    // Run the same metadata preference through three existing filtered algorithms.
+    // All must return the favored eligible item without changing their implementations.
     #[rstest::rstest]
     #[case::inline(false, false)]
     #[case::adaptive_inline(false, true)]

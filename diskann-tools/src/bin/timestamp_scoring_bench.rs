@@ -5,6 +5,22 @@
 
 //! Compare vector-only, post-reranked, and metadata-aware search on held-out queries.
 //!
+//! # Reading This Experiment
+//!
+//! Each item and query is represented by a list of numbers called a vector. A smaller
+//! vector distance means a closer numerical match. We add made-up timestamps to ask:
+//! can search find newer items without giving up too much vector similarity?
+//!
+//! All three methods use the same graph. One ignores timestamps, one uses them only
+//! after graph exploration, and one uses them during exploration as well as final ranking.
+//! The comparison measures both answer quality and the extra time required.
+//!
+//! Here, `k` is the number of answers requested, `L` is the candidate-list budget used
+//! during exploration, and `weight` controls how strongly age affects the score.
+//! "Ground truth" means exact answers obtained by checking every stored vector;
+//! "recall" is the fraction of those answers the faster graph search actually finds.
+//! Our separate relevance check is a numerical proxy, not a human judgment of usefulness.
+//!
 //! # Reproduce
 //!
 //! ```text
@@ -68,6 +84,8 @@ use diskann_vector::{
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Serialize;
 
+// Settings supplied on the command line. Defaults reproduce the experiment below;
+// changing them lets readers compare accuracy, freshness, and speed at different budgets.
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long)]
@@ -94,6 +112,8 @@ struct Args {
     output: Option<PathBuf>,
 }
 
+// Save both the experiment setup and its measurements, so the numbers can be interpreted
+// later without relying on whatever settings happen to be the defaults at that time.
 #[derive(Serialize)]
 struct Report {
     dataset: PathBuf,
@@ -111,6 +131,8 @@ struct Report {
     measurements: Vec<Measurement>,
 }
 
+// One row of results for one method, timestamp weight, and search budget.
+// Age and distance measure answer quality; latency and comparisons measure search cost.
 #[derive(Serialize)]
 struct Measurement {
     method: &'static str,
@@ -125,12 +147,17 @@ struct Measurement {
     mean_comparisons: f64,
 }
 
+// Keep two independent reference views for each query: plain vector similarity and
+// the exact best answers after adding the timestamp penalty. Fresh does not itself
+// mean relevant, so the benchmark reports both rather than combining all judgments.
 struct GroundTruth {
     vector_distances: Vec<f32>,
     relevance_cutoff: f32,
     combined: Vec<Vec<u32>>,
 }
 
+// Accumulate repeated query measurements before computing a summary row. Individual
+// query times are retained so the median and slower-query percentile can be reported.
 #[derive(Default)]
 struct Totals {
     hits: usize,
@@ -142,6 +169,8 @@ struct Totals {
     durations_us: Vec<f64>,
 }
 
+// Read a rectangular block of vectors from the binary input. Give each vector length
+// one so distance and age can be combined on a more predictable numerical scale.
 fn read_matrix(
     reader: &mut impl ReadBytesExt,
     rows: usize,
@@ -149,6 +178,7 @@ fn read_matrix(
 ) -> Result<rowmajor::Owned<f32>> {
     let mut data = rowmajor::Owned::try_from_element(rows, dimensions, 0.0_f32)?;
     reader.read_f32_into::<LittleEndian>(data.as_mut_slice())?;
+    // Reject unusable vectors rather than allowing invalid scores into the comparison.
     for row_index in 0..rows {
         let row = data.row_mut(row_index);
         let norm = row.iter().map(|value| value * value).sum::<f32>().sqrt();
@@ -163,6 +193,8 @@ fn read_matrix(
     Ok(data)
 }
 
+// Select the best k items from an already scored collection, then put those answers
+// in best-first order. There is no graph approximation in this reference selection.
 fn nearest(mut candidates: Vec<Neighbor<u32>>, k: usize) -> Vec<Neighbor<u32>> {
     candidates.select_nth_unstable_by(k - 1, neighbor::ord::fast_distance);
     candidates.truncate(k);
@@ -170,6 +202,8 @@ fn nearest(mut candidates: Vec<Neighbor<u32>>, k: usize) -> Vec<Neighbor<u32>> {
     candidates
 }
 
+// Establish exact reference answers by comparing each query with every stored vector.
+// This expensive work happens outside the timed search, and is shared by all methods.
 fn ground_truth(
     base: rowmajor::Ref<'_, f32>,
     queries: rowmajor::Ref<'_, f32>,
@@ -178,9 +212,13 @@ fn ground_truth(
 ) -> Vec<GroundTruth> {
     (0..queries.nrows())
         .map(|query_index| {
+            // Compute vector similarity once. Reuse these distances for every timestamp
+            // weight, so differences in reference answers come only from the policy.
             let distances: Vec<_> = (0..base.nrows())
                 .map(|id| SquaredL2::evaluate(queries.row(query_index), base.row(id)))
                 .collect();
+            // Define the independent relevance guardrail using the vector-only top N.
+            // The boundary is a distance, so equally similar items at the cutoff all qualify.
             let relevance_cutoff = *nearest(
                 distances
                     .iter()
@@ -192,6 +230,8 @@ fn ground_truth(
             .last()
             .unwrap()
             .distance();
+            // For each age weight, exhaustively score the entire collection and retain
+            // its exact top k. Newer items have less age penalty; weight zero ignores age.
             let combined = args
                 .weights
                 .iter()
@@ -223,7 +263,10 @@ fn ground_truth(
         .collect()
 }
 
+// Run the complete experiment once: load data, build one index, establish reference
+// answers, measure the search methods, and optionally save a machine-readable report.
 fn main() -> Result<()> {
+    // Validate the requested experiment before allocating data or starting a long build.
     let args = Args::parse();
     ensure!(
         args.points > 0 && args.points < u32::MAX as usize,
@@ -243,6 +286,8 @@ fn main() -> Result<()> {
         "invalid weight"
     );
 
+    // The first two numbers in an fbin file describe its rows and vector dimensions.
+    // Use an initial block for stored items and the following, separate block for queries.
     let mut reader = BufReader::new(File::open(&args.data).context("open fbin data")?);
     let rows = reader.read_u32::<LittleEndian>()? as usize;
     let dimensions = reader.read_u32::<LittleEndian>()? as usize;
@@ -254,10 +299,14 @@ fn main() -> Result<()> {
     ensure!(requested <= rows, "need {requested} rows, file has {rows}");
     let base = read_matrix(&mut reader, args.points, dimensions)?;
     let queries = read_matrix(&mut reader, args.queries, dimensions)?;
+    // Assign synthetic timestamps independently of vector similarity. The fixed seed
+    // makes those timestamps repeatable; all queries ask from the same present day, 365.
     let mut rng = StdRng::seed_from_u64(args.seed);
     let timestamps: Vec<f32> = (0..args.points)
         .map(|_| rng.random_range(0.0..365.0))
         .collect();
+    // Build a normal full-precision vector index, with no timestamps involved in graph
+    // construction. All search methods below will use this exact same set of connections.
     let runtime = diskann_benchmark_core::tokio::runtime(args.threads.get())?;
     let config = graph::config::Builder::new(
         32,
@@ -276,6 +325,8 @@ fn main() -> Result<()> {
         max_degree: config.max_degree_u32().get(),
     };
     let index: MemoryIndex<f32> = new_index(config, parameters, NoDeletes)?;
+    // Start graph exploration near the average stored vector. This is a synthetic entry
+    // point, not an extra user item, and it should not be returned as an answer.
     let mut centroid = vec![0.0; dimensions];
     for row in 0..base.nrows() {
         for (sum, value) in centroid.iter_mut().zip(base.row(row)) {
@@ -286,6 +337,8 @@ fn main() -> Result<()> {
         .provider()
         .set_start_points(std::iter::once(centroid.as_slice()))?;
     let context = DefaultContext;
+    // Insert items in batches of 1,000 and report build progress. Build time is recorded
+    // separately from query latency, so ingestion does not distort the search comparison.
     let build_start = Instant::now();
     for start in (0..args.points).step_by(1000) {
         let end = start.saturating_add(1000).min(args.points);
@@ -309,6 +362,8 @@ fn main() -> Result<()> {
         }
     }
     let build_seconds = build_start.elapsed().as_secs_f64();
+    // Compute exact ground truth before timing any query. This scans all vectors, unlike
+    // graph search, so it provides a reference rather than a competing fast search method.
     let gt_start = Instant::now();
     let truth = ground_truth(base.as_view(), queries.as_view(), &timestamps, &args);
     let ground_truth_seconds = gt_start.elapsed().as_secs_f64();
@@ -316,16 +371,24 @@ fn main() -> Result<()> {
     let mut measurements = Vec::new();
     println!("weight L method recall relevant mean_L2 age_days p50_us p95_us cmps");
 
+    // Sweep the importance of freshness. Weight zero is a control: all methods should
+    // target the same vector-only answers, revealing the scoring wrapper's extra cost.
     for (weight_index, &weight) in args.weights.iter().enumerate() {
+        // An item's score is vector distance plus a penalty for its fraction-of-year age.
+        // Synthetic graph entry points have no timestamp and keep their original distance.
         let score = |id: u32, distance: f32| {
             distance
                 + timestamps
                     .get(id as usize)
                     .map_or(0.0, |timestamp| weight * (365.0 - timestamp) / 365.0)
         };
+        // This is where the new feature enters the existing graph-search pipeline.
+        // The first callback scores exploration; the second scores finished answers.
         let strategy = Scored::new(FullPrecision, score, |id: &u32, distance| {
             score(*id, distance)
         });
+        // Give each method the same candidate budget. Larger L usually increases both
+        // exploration cost and the chance of finding the desired answers.
         for &search_l in &args.l {
             let mut totals: [Totals; 3] = std::array::from_fn(|_| Totals::default());
             let query_count = args
@@ -335,6 +398,8 @@ fn main() -> Result<()> {
             let run_count = query_count
                 .checked_add(args.queries.min(10))
                 .context("warmup count overflow")?;
+            // Warm up a few queries, then repeat the measured workload. Rotate method
+            // order to avoid always giving the same method the first or last cache state.
             for run in 0..run_count {
                 let warmup = run < args.queries.min(10);
                 let query_index = run % args.queries;
@@ -344,8 +409,12 @@ fn main() -> Result<()> {
                     let mut output = Vec::new();
                     let mut fixed = vec![Neighbor::default(); args.k];
                     let params = Knn::new_default(search_l)?;
+                    // Time search and any final reranking, but not loading, building, or
+                    // exact-ground-truth computation. Caller output buffers are already ready.
                     let started = Instant::now();
                     let stats = if method == 1 {
+                        // Post-rerank baseline: explore using vector distance alone,
+                        // then use timestamps to reorder the candidates that were found.
                         let stats = runtime.block_on(index.search(
                             params,
                             &FullPrecision,
@@ -364,8 +433,12 @@ fn main() -> Result<()> {
                         output.truncate(args.k);
                         stats
                     } else {
+                        // These paths return directly into a fixed-size answer buffer.
+                        // The scoring adapter handles its own final reranking internally.
                         let mut buffer = BackInserter::new(&mut fixed);
                         let stats = if method == 0 {
+                            // Vanilla baseline: no metadata scoring, either during
+                            // exploration or when choosing the final answers.
                             runtime.block_on(index.search(
                                 params,
                                 &FullPrecision,
@@ -374,6 +447,8 @@ fn main() -> Result<()> {
                                 &mut buffer,
                             ))?
                         } else {
+                            // Metadata-aware search: adjusted scores reach the graph's
+                            // candidate queue, changing which connections it explores next.
                             runtime.block_on(index.search(
                                 params,
                                 &strategy,
@@ -394,6 +469,9 @@ fn main() -> Result<()> {
                     if warmup {
                         continue;
                     }
+                    // Compare returned IDs with exact combined-score answers. Separately
+                    // record whether they remain vector-relevant, how far away they are,
+                    // how old they are, and how much search work was needed.
                     let total = &mut totals[method];
                     total.durations_us.push(micros);
                     total.comparisons += u64::from(stats.cmps);
@@ -412,6 +490,8 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            // Summarize quality and cost for this configuration. Recall and relevance
+            // are fractions; p50 is median latency and p95 describes the slower-query tail.
             for (method, mut total) in ["vanilla", "post_rerank", "metadata_aware"]
                 .into_iter()
                 .zip(totals)
@@ -444,6 +524,8 @@ fn main() -> Result<()> {
             }
         }
     }
+    // Optionally save every summary row alongside the dataset and policy settings.
+    // The output is an experiment report, not a saved index or an extra input dataset.
     if let Some(path) = &args.output {
         let report = Report {
             dataset: args.data.clone(),
@@ -469,10 +551,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+// These fast tests check the measuring tool itself. They use tiny inputs and do not
+// rerun the 100k-vector experiment as part of an ordinary test run.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Make sure reference selection returns exactly the best items in the right order,
+    // even when the input arrives unsorted.
     #[test]
     fn nearest_selects_and_sorts_exact_top_k() {
         let candidates = vec![
@@ -486,6 +572,8 @@ mod tests {
         assert_eq!(selected[1].as_tuple(), (3, 2.0));
     }
 
+    // A known 3-4 vector should become a unit-length 0.6-0.8 vector. Also verify that
+    // truncated data and zero-length vectors fail instead of contaminating the experiment.
     #[test]
     fn matrix_loading_normalizes_and_rejects_invalid_data() {
         let bytes: Vec<_> = [3.0_f32, 4.0]
@@ -498,6 +586,8 @@ mod tests {
         assert!(read_matrix(&mut [0u8; 8].as_slice(), 1, 2).is_err());
     }
 
+    // Build an example where the closest vector is old and a less similar vector is new.
+    // Timestamp preference must change exact GT without redefining vector relevance.
     #[test]
     fn ground_truth_separates_vector_relevance_and_recency() {
         let base = rowmajor::Owned::from_fn(3, 2, |position| {
